@@ -1,3 +1,4 @@
+# cspell:words aggfunc fastmcp openpyxl xlsm sheetnames multisheet
 from __future__ import annotations
 
 import re
@@ -13,6 +14,9 @@ from mcp.types import ErrorData, INTERNAL_ERROR
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import range_boundaries
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
+
+from functools import wraps
+
 
 mcp = FastMCP("excel-tools")
 
@@ -100,22 +104,13 @@ def _active_sheet(wb: Workbook) -> Any:
 # Utility helpers
 # ---------------------------------------------------------
 
-
 def safe_run(fn: _F) -> _F:
-    """
-    Wrap every tool so that exceptions are surfaced as McpError rather than
-    crashing the server or returning a success-shaped dict with an 'error' key.
-
-    FIX: The original decorator returned {"error": str(e)}, which looks like a
-    successful tool result to the model. Raising McpError marks the call as
-    failed in the MCP protocol so the agent can react correctly.
-    """
-
+    @wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         try:
             return fn(*args, **kwargs)
         except McpError:
-            raise  # already well-formed; don't double-wrap
+            raise
         except Exception as e:
             raise McpError(ErrorData(code=INTERNAL_ERROR, message=str(e))) from e
 
@@ -1074,4 +1069,4 @@ def create_summary_sheet(
 # ---------------------------------------------------------
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="stdio")
