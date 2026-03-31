@@ -12,8 +12,9 @@ from mcp.server.fastmcp import FastMCP
 from mcp.shared.exceptions import McpError  # ← proper protocol-level errors
 from mcp.types import ErrorData, INTERNAL_ERROR
 from openpyxl import Workbook, load_workbook
-from openpyxl.utils import range_boundaries
+from openpyxl.utils import get_column_letter, range_boundaries
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from functools import wraps
 
@@ -98,6 +99,38 @@ def _active_sheet(wb: Workbook) -> Any:
     if ws is None:
         raise RuntimeError("Workbook has no active worksheet")
     return ws
+
+
+def _sanitize_table_display_name(raw: str) -> str:
+    """Excel table displayName: letter-first, alphanumeric + underscore."""
+    s = re.sub(r"[^0-9a-zA-Z_]", "_", (raw or "Table").strip())
+    if not s:
+        s = "Table"
+    if s[0].isdigit():
+        s = "t_" + s
+    return s[:255]
+
+
+def _workbook_table_display_names(wb: Workbook) -> set[str]:
+    names: set[str] = set()
+    for s in wb.worksheets:
+        for t in s.tables.values():
+            dn = getattr(t, "displayName", None) or getattr(t, "name", None)
+            if dn:
+                names.add(str(dn))
+    return names
+
+
+def _allocate_table_display_name(wb: Workbook, base: str) -> str:
+    base = _sanitize_table_display_name(base)
+    used = _workbook_table_display_names(wb)
+    cand = base
+    n = 1
+    while cand in used:
+        n += 1
+        suffix = f"_{n}"
+        cand = f"{base[: max(1, 255 - len(suffix))]}{suffix}"
+    return cand
 
 
 # ---------------------------------------------------------
@@ -213,6 +246,10 @@ def _safe_write_sheet(
     path: Path,
     sheet_name: str,
     df: pd.DataFrame,
+    *,
+    excel_table: bool = False,
+    table_display_name: str | None = None,
+    table_style: str = "TableStyleMedium2",
 ) -> None:
     """
     Write tabular data to one sheet using openpyxl (headers + rows).
@@ -221,6 +258,9 @@ def _safe_write_sheet(
     that sheet (charts, tables, formatting on that tab) is lost. Other
     worksheets are untouched, which avoids pandas ExcelWriter re-saving the
     whole book in a way that can disturb workbook-level metadata.
+
+    When excel_table is True and the frame has at least one data row, an Excel
+    Table (ListObject) is added over the header + body range with banded rows.
     """
     st = _truncate_sheet_title(sheet_name)
 
@@ -246,6 +286,22 @@ def _safe_write_sheet(
             if hasattr(val, "item"):
                 val = val.item()  # type: ignore[assignment]
             _set_cell_value(ws, row_idx, col_idx, val)
+
+    if excel_table and not df.empty and len(df.columns) > 0:
+        nrows = len(df) + 1
+        ncols = len(df.columns)
+        ref = f"A1:{get_column_letter(ncols)}{nrows}"
+        base_nm = table_display_name or f"tbl_{sheet_name}"
+        disp = _allocate_table_display_name(wb, base_nm)
+        tab = Table(displayName=disp, ref=ref)
+        tab.tableStyleInfo = TableStyleInfo(
+            name=table_style,
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        ws.add_table(tab)
 
     wb.save(path)
     wb.close()
@@ -775,20 +831,36 @@ def query_workbook(
 @mcp.tool()
 @safe_run
 def write_sheet(
-    file_path: str, sheet_name: str, data: list[dict[str, Any]]
+    file_path: str,
+    sheet_name: str,
+    data: list[dict[str, Any]],
+    as_excel_table: bool = False,
+    table_display_name: str | None = None,
+    table_style: str = "TableStyleMedium2",
 ) -> str:
     """
     Write rows to a sheet; creates a new workbook if the file does not exist.
 
     Uses openpyxl via _safe_write_sheet: other sheets are left alone; the
     named sheet is replaced (see _safe_write_sheet for what is preserved).
+
+    Set as_excel_table=True to format the range as an Excel Table (ListObject)
+    with header row and banded rows (table_style defaults to TableStyleMedium2).
     """
     path = Path(file_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     st = _truncate_sheet_title(sheet_name)
     df = pd.DataFrame(data)
-    _safe_write_sheet(path, st, df)
-    return f"Sheet '{st}' written ({len(data)} rows)."
+    _safe_write_sheet(
+        path,
+        st,
+        df,
+        excel_table=as_excel_table,
+        table_display_name=table_display_name,
+        table_style=table_style,
+    )
+    extra = " as an Excel Table" if as_excel_table and not df.empty else ""
+    return f"Sheet '{st}' written ({len(data)} rows){extra}."
 
 
 @mcp.tool()
