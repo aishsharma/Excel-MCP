@@ -1,10 +1,10 @@
-# cspell:words aggfunc fastmcp openpyxl xlsm sheetnames multisheet
+# cspell:words aggfunc fastmcp openpyxl xlsm sheetnames multisheet xlrd xlwt
 from __future__ import annotations
 
 import re
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast
 
 import duckdb
 import pandas as pd
@@ -23,16 +23,48 @@ mcp = FastMCP("excel-tools")
 
 _F = TypeVar("_F", bound=Callable[..., Any])
 
-_EXCEL_SUFFIXES = frozenset({".xlsx", ".xlsm"})
-_TABULAR_SUFFIXES = frozenset({".xlsx", ".xlsm", ".csv", ".parquet"})
+# Pandas read_excel / ExcelFile engine parameter (stubs use Literal, not str).
+_ExcelReadEngine = Literal["openpyxl", "xlrd"]
+
+_OPENPYXL_SUFFIXES = frozenset({".xlsx", ".xlsm"})
+_LEGACY_EXCEL_SUFFIXES = frozenset({".xls"})
+_TABULAR_SUFFIXES = frozenset(
+    {".xlsx", ".xlsm", ".xls", ".csv", ".parquet"}
+)
 _EXCEL_SHEET_NAME_MAX = 31
 
 # Maximum rows returned by SQL / filter tools — callers can paginate via OFFSET.
 _SQL_ROW_LIMIT = 200
 
 
-def _is_excel_path(path: Path) -> bool:
-    return path.suffix.lower() in _EXCEL_SUFFIXES
+def _is_openpyxl_workbook(path: Path) -> bool:
+    return path.suffix.lower() in _OPENPYXL_SUFFIXES
+
+
+def _is_legacy_excel_path(path: Path) -> bool:
+    return path.suffix.lower() in _LEGACY_EXCEL_SUFFIXES
+
+
+def _excel_read_engine(path: Path) -> _ExcelReadEngine:
+    if _is_legacy_excel_path(path):
+        return "xlrd"
+    if _is_openpyxl_workbook(path):
+        return "openpyxl"
+    raise ValueError(f"Not an Excel workbook path: {path.suffix}")
+
+
+def _is_workbook_multiquery_path(path: Path) -> bool:
+    """.xlsx / .xlsm / .xls — supported by query_workbook."""
+    return _is_openpyxl_workbook(path) or _is_legacy_excel_path(path)
+
+
+def _legacy_xls_hint(path: Path) -> str:
+    if path.suffix.lower() == ".xls":
+        return (
+            " For .xls files, use convert_legacy_excel_to_xlsx first, "
+            "then open the resulting .xlsx."
+        )
+    return ""
 
 
 def _keep_vba(path: Path) -> bool:
@@ -150,18 +182,26 @@ def safe_run(fn: _F) -> _F:
     return cast(_F, wrapper)
 
 
-def load_data(file_path: str, sheet_name: str | int | None = None) -> pd.DataFrame:
-    """Load data from Excel, CSV, or Parquet and always return a DataFrame."""
+def load_data(
+    file_path: str,
+    sheet_name: str | int | None = None,
+    *,
+    csv_sep: str | None = None,
+    csv_encoding: str | None = None,
+    csv_decimal: str | None = None,
+) -> pd.DataFrame:
+    """Load data from Excel (.xlsx / .xlsm / .xls), CSV, or Parquet."""
     path = Path(file_path)
 
     if not path.exists():
         raise FileNotFoundError(f"{file_path} not found")
 
-    if _is_excel_path(path):
+    if _is_openpyxl_workbook(path) or _is_legacy_excel_path(path):
         if sheet_name is None:
             sheet_name = 0  # default to first sheet
+        engine = _excel_read_engine(path)
         excel_result = pd.read_excel(
-            file_path, sheet_name=sheet_name, engine="openpyxl"
+            file_path, sheet_name=sheet_name, engine=engine
         )
         if isinstance(excel_result, dict):
             sheets = cast(dict[Any, pd.DataFrame], excel_result)
@@ -180,7 +220,14 @@ def load_data(file_path: str, sheet_name: str | int | None = None) -> pd.DataFra
 
     suf = path.suffix.lower()
     if suf == ".csv":
-        return pd.read_csv(file_path)
+        csv_kw: dict[str, Any] = {}
+        if csv_sep is not None:
+            csv_kw["sep"] = csv_sep
+        if csv_encoding is not None:
+            csv_kw["encoding"] = csv_encoding
+        if csv_decimal is not None:
+            csv_kw["decimal"] = csv_decimal
+        return pd.read_csv(file_path, **csv_kw)
 
     if suf == ".parquet":
         return pd.read_parquet(file_path)
@@ -337,8 +384,10 @@ def list_datasets(folder_path: str) -> list[str]:
 def inspect_excel(file_path: str) -> dict[str, Any]:
     """Return sheet names, columns, types, and preview rows."""
     path = Path(file_path)
-    if not _is_excel_path(path):
-        raise ValueError("inspect_excel only supports .xlsx and .xlsm workbooks")
+    if not _is_openpyxl_workbook(path):
+        raise ValueError(
+            f"inspect_excel only supports .xlsx and .xlsm workbooks.{_legacy_xls_hint(path)}"
+        )
 
     with pd.ExcelFile(file_path, engine="openpyxl") as xls:
         info: dict[str, Any] = {}
@@ -359,14 +408,47 @@ def inspect_excel(file_path: str) -> dict[str, Any]:
 
 @mcp.tool()
 @safe_run
+def inspect_csv(
+    file_path: str,
+    csv_sep: str | None = None,
+    csv_encoding: str | None = None,
+    csv_decimal: str | None = None,
+) -> dict[str, Any]:
+    """Return columns, dtypes, and preview rows for a CSV (reads first 20 rows)."""
+    path = Path(file_path)
+    if path.suffix.lower() != ".csv":
+        raise ValueError("inspect_csv only supports .csv files")
+    if not path.exists():
+        raise FileNotFoundError(file_path)
+
+    csv_kw: dict[str, Any] = {"nrows": 20}
+    if csv_sep is not None:
+        csv_kw["sep"] = csv_sep
+    if csv_encoding is not None:
+        csv_kw["encoding"] = csv_encoding
+    if csv_decimal is not None:
+        csv_kw["decimal"] = csv_decimal
+    df = pd.read_csv(file_path, **csv_kw)
+
+    return {
+        "columns": list(df.columns),
+        "dtypes": df.dtypes.astype(str).to_dict(),
+        "preview_rows": _df_to_records(df.head(5)),
+    }
+
+
+@mcp.tool()
+@safe_run
 def workbook_structure(file_path: str) -> dict[str, Any]:
     """
     List sheets, used dimensions, and Excel Table (ListObject) definitions.
     For .xlsx / .xlsm only (openpyxl).
     """
     path = Path(file_path)
-    if not _is_excel_path(path):
-        raise ValueError("workbook_structure requires .xlsx or .xlsm")
+    if not _is_openpyxl_workbook(path):
+        raise ValueError(
+            f"workbook_structure requires .xlsx or .xlsm.{_legacy_xls_hint(path)}"
+        )
 
     wb = load_workbook(
         file_path, data_only=True, keep_vba=_keep_vba(path), read_only=False
@@ -420,8 +502,10 @@ def read_excel_range(
     together with max_cells to paginate large ranges.
     """
     path = Path(file_path)
-    if not _is_excel_path(path):
-        raise ValueError("read_excel_range requires .xlsx or .xlsm")
+    if not _is_openpyxl_workbook(path):
+        raise ValueError(
+            f"read_excel_range requires .xlsx or .xlsm.{_legacy_xls_hint(path)}"
+        )
     if value_mode not in ("computed", "stored"):
         raise ValueError('value_mode must be "computed" or "stored"')
 
@@ -483,8 +567,10 @@ def read_excel_table(
     read_excel_range for full details on this caveat.
     """
     path = Path(file_path)
-    if not _is_excel_path(path):
-        raise ValueError("read_excel_table requires .xlsx or .xlsm")
+    if not _is_openpyxl_workbook(path):
+        raise ValueError(
+            f"read_excel_table requires .xlsx or .xlsm.{_legacy_xls_hint(path)}"
+        )
     if value_mode not in ("computed", "stored"):
         raise ValueError('value_mode must be "computed" or "stored"')
 
@@ -534,10 +620,20 @@ def read_excel_table(
 @mcp.tool()
 @safe_run
 def dataset_summary(
-    file_path: str, sheet_name: str | int | None = None
+    file_path: str,
+    sheet_name: str | int | None = None,
+    csv_sep: str | None = None,
+    csv_encoding: str | None = None,
+    csv_decimal: str | None = None,
 ) -> dict[str, Any]:
     """Return row count, column names, dtypes, and per-column null counts."""
-    df = load_data(file_path, sheet_name)
+    df = load_data(
+        file_path,
+        sheet_name,
+        csv_sep=csv_sep,
+        csv_encoding=csv_encoding,
+        csv_decimal=csv_decimal,
+    )
 
     return {
         "rows": len(df),
@@ -550,10 +646,20 @@ def dataset_summary(
 @mcp.tool()
 @safe_run
 def dataset_shape(
-    file_path: str, sheet_name: str | int | None = None
+    file_path: str,
+    sheet_name: str | int | None = None,
+    csv_sep: str | None = None,
+    csv_encoding: str | None = None,
+    csv_decimal: str | None = None,
 ) -> dict[str, int]:
     """Return dataset shape."""
-    df = load_data(file_path, sheet_name)
+    df = load_data(
+        file_path,
+        sheet_name,
+        csv_sep=csv_sep,
+        csv_encoding=csv_encoding,
+        csv_decimal=csv_decimal,
+    )
 
     return {
         "rows": len(df),
@@ -564,10 +670,21 @@ def dataset_shape(
 @mcp.tool()
 @safe_run
 def sample_rows(
-    file_path: str, sheet_name: str | int | None = None, n: int = 20
+    file_path: str,
+    sheet_name: str | int | None = None,
+    n: int = 20,
+    csv_sep: str | None = None,
+    csv_encoding: str | None = None,
+    csv_decimal: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return random sample rows."""
-    df = load_data(file_path, sheet_name)
+    df = load_data(
+        file_path,
+        sheet_name,
+        csv_sep=csv_sep,
+        csv_encoding=csv_encoding,
+        csv_decimal=csv_decimal,
+    )
 
     if len(df) == 0:
         return []
@@ -582,9 +699,24 @@ def sample_rows(
 
 @mcp.tool()
 @safe_run
-def read_sheet(file_path: str, sheet_name: str | int) -> dict[str, Any]:
-    """Read a specific sheet (name or zero-based index for Excel)."""
-    df = load_data(file_path, sheet_name)
+def read_sheet(
+    file_path: str,
+    sheet_name: str | int | None = None,
+    csv_sep: str | None = None,
+    csv_encoding: str | None = None,
+    csv_decimal: str | None = None,
+) -> dict[str, Any]:
+    """
+    Read a sheet (Excel) or full file (CSV / Parquet). For Excel, sheet_name
+    defaults to the first sheet when omitted. For CSV / Parquet, sheet_name is ignored.
+    """
+    df = load_data(
+        file_path,
+        sheet_name,
+        csv_sep=csv_sep,
+        csv_encoding=csv_encoding,
+        csv_decimal=csv_decimal,
+    )
 
     return {
         "rows": len(df),
@@ -596,10 +728,20 @@ def read_sheet(file_path: str, sheet_name: str | int) -> dict[str, Any]:
 @mcp.tool()
 @safe_run
 def summarize_dataset(
-    file_path: str, sheet_name: str | int | None = None
+    file_path: str,
+    sheet_name: str | int | None = None,
+    csv_sep: str | None = None,
+    csv_encoding: str | None = None,
+    csv_decimal: str | None = None,
 ) -> dict[str, Any]:
     """Return pandas descriptive statistics (describe), including non-numeric columns."""
-    df = load_data(file_path, sheet_name)
+    df = load_data(
+        file_path,
+        sheet_name,
+        csv_sep=csv_sep,
+        csv_encoding=csv_encoding,
+        csv_decimal=csv_decimal,
+    )
 
     return df.describe(include="all").to_dict()
 
@@ -613,12 +755,16 @@ def summarize_dataset(
 @safe_run
 def filter_rows(
     file_path: str,
-    sheet_name: str | int,
     column: str,
     value: Any,
+    *,
+    sheet_name: str | int | None = None,
     operator: str = "==",
     limit: int = 100,
     offset: int = 0,
+    csv_sep: str | None = None,
+    csv_encoding: str | None = None,
+    csv_decimal: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Filter rows using a column condition with optional pagination.
@@ -626,8 +772,16 @@ def filter_rows(
     operators: ==, >, <, >=, <=, !=, contains
     limit:  max rows to return (default 100).
     offset: skip this many matching rows before returning (for pagination).
+    For Excel, pass sheet_name (name or index) or omit for the first sheet.
+    For CSV / Parquet, sheet_name is ignored.
     """
-    df = load_data(file_path, sheet_name)
+    df = load_data(
+        file_path,
+        sheet_name,
+        csv_sep=csv_sep,
+        csv_encoding=csv_encoding,
+        csv_decimal=csv_decimal,
+    )
     validate_columns(df, [column])
 
     coerced: Any = value
@@ -670,13 +824,23 @@ def filter_rows(
 @safe_run
 def pivot_table(
     file_path: str,
-    sheet_name: str | int,
     index: str | list[str],
     values: str | list[str],
+    *,
+    sheet_name: str | int | None = None,
     agg: str = "sum",
+    csv_sep: str | None = None,
+    csv_encoding: str | None = None,
+    csv_decimal: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Create a pivot table."""
-    df = load_data(file_path, sheet_name)
+    """Create a pivot table. For Excel, omit sheet_name for the first sheet."""
+    df = load_data(
+        file_path,
+        sheet_name,
+        csv_sep=csv_sep,
+        csv_encoding=csv_encoding,
+        csv_decimal=csv_decimal,
+    )
 
     index_cols = [index] if isinstance(index, str) else list(index)
     value_cols = [values] if isinstance(values, str) else list(values)
@@ -708,9 +872,18 @@ def top_values(
     column: str,
     sheet_name: str | int | None = None,
     n: int = 10,
+    csv_sep: str | None = None,
+    csv_encoding: str | None = None,
+    csv_decimal: str | None = None,
 ) -> dict[Any, int]:
     """Return most common values in a column."""
-    df = load_data(file_path, sheet_name)
+    df = load_data(
+        file_path,
+        sheet_name,
+        csv_sep=csv_sep,
+        csv_encoding=csv_encoding,
+        csv_decimal=csv_decimal,
+    )
     validate_columns(df, [column])
 
     counts = df[column].value_counts().head(n)
@@ -731,12 +904,16 @@ def query_dataset(
     sheet_name: str | int | None = None,
     limit: int = _SQL_ROW_LIMIT,
     offset: int = 0,
+    csv_sep: str | None = None,
+    csv_encoding: str | None = None,
+    csv_decimal: str | None = None,
 ) -> dict[str, Any]:
     """
     Run SQL on the loaded table registered as "data".
 
-    For .xlsx / .xlsm, one sheet is loaded; pass sheet_name (name or index) to
-    choose it (default: first sheet). For joins across sheets use query_workbook.
+    Loads one sheet from .xlsx / .xlsm / .xls (pass sheet_name as name or index;
+    default: first sheet), or a CSV / Parquet file (sheet_name ignored).
+    For joins across Excel sheets use query_workbook.
 
     Pagination: use limit and offset to page through large result sets.
     The tool appends LIMIT/OFFSET automatically — do NOT add them to your query.
@@ -744,7 +921,13 @@ def query_dataset(
     ⚠ SQL runs locally in DuckDB against an in-memory DataFrame. Do not pass
     untrusted user input in production environments.
     """
-    df = load_data(file_path, sheet_name)
+    df = load_data(
+        file_path,
+        sheet_name,
+        csv_sep=csv_sep,
+        csv_encoding=csv_encoding,
+        csv_decimal=csv_decimal,
+    )
 
     paginated_query = f"SELECT * FROM ({query}) _q LIMIT {limit} OFFSET {offset}"
 
@@ -774,6 +957,7 @@ def query_workbook(
 ) -> dict[str, Any]:
     """
     Load multiple Excel sheets into DuckDB and run one SQL query.
+    Supports .xlsx, .xlsm, and legacy .xls (via xlrd).
 
     Each sheet is registered under a SQL-safe name (see registered_tables).
     Sanitized names replace non-alphanumeric characters with underscores;
@@ -786,10 +970,13 @@ def query_workbook(
     natural alias for one sheet matches a suffixed alias for another.
     """
     path = Path(file_path)
-    if not _is_excel_path(path):
-        raise ValueError("query_workbook supports .xlsx and .xlsm only")
+    if not _is_workbook_multiquery_path(path):
+        raise ValueError(
+            "query_workbook supports .xlsx, .xlsm, and .xls workbooks only"
+        )
 
-    with pd.ExcelFile(file_path, engine="openpyxl") as xlf:
+    engine = _excel_read_engine(path)
+    with pd.ExcelFile(file_path, engine=engine) as xlf:
         all_names: list[str] = [str(x) for x in list(xlf.sheet_names)]
         if sheet_names is not None:
             chosen: list[str] = [str(s) for s in sheet_names]
@@ -807,7 +994,7 @@ def query_workbook(
         try:
             for orig in chosen:
                 df = pd.read_excel(
-                    file_path, sheet_name=orig, engine="openpyxl"
+                    file_path, sheet_name=orig, engine=engine
                 )
                 con.register(aliases[orig], df)
             result = con.execute(paginated_query).df()
@@ -821,6 +1008,52 @@ def query_workbook(
             "returned_rows": len(result),
             "rows": _df_to_records(result),
         }
+
+
+@mcp.tool()
+@safe_run
+def convert_legacy_excel_to_xlsx(
+    source_path: str,
+    output_path: str,
+    if_file_exists: str = "replace",
+) -> str:
+    """
+    Convert a legacy .xls workbook to .xlsx (all sheets) using pandas + openpyxl.
+    Sheet names are truncated to 31 characters; collisions after truncation raise.
+    """
+    src = Path(source_path)
+    out = Path(output_path)
+    if not _is_legacy_excel_path(src):
+        raise ValueError("source_path must be a .xls file")
+    if out.suffix.lower() != ".xlsx":
+        raise ValueError("output_path must end with .xlsx")
+    if not src.exists():
+        raise FileNotFoundError(source_path)
+    if out.exists() and if_file_exists == "error":
+        raise FileExistsError(output_path)
+
+    xls_engine: Literal["xlrd"] = "xlrd"
+    with pd.ExcelFile(source_path, engine=xls_engine) as xlf:
+        raw_names: list[str] = [str(x) for x in list(xlf.sheet_names)]
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    seen: set[str] = set()
+    with pd.ExcelWriter(out, engine="openpyxl", mode="w") as writer:
+        for raw in raw_names:
+            sn = _truncate_sheet_title(raw)
+            if sn in seen:
+                raise ValueError(
+                    f"Duplicate sheet name after truncation: {sn!r}"
+                )
+            seen.add(sn)
+            df = pd.read_excel(
+                source_path, sheet_name=raw, engine=xls_engine
+            )
+            df.to_excel(writer, sheet_name=sn, index=False)
+
+    return (
+        f"Converted {source_path!r} → {output_path!r} ({len(raw_names)} sheet(s))."
+    )
 
 
 # ---------------------------------------------------------
@@ -878,8 +1111,10 @@ def append_rows_to_sheet(
     if not data:
         return "No rows to append."
     path = Path(file_path)
-    if not _is_excel_path(path):
-        raise ValueError("append_rows_to_sheet requires .xlsx or .xlsm")
+    if not _is_openpyxl_workbook(path):
+        raise ValueError(
+            f"append_rows_to_sheet requires .xlsx or .xlsm.{_legacy_xls_hint(path)}"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     st = _truncate_sheet_title(sheet_name)
     keys = list(data[0].keys())
@@ -964,8 +1199,10 @@ def write_multisheet_workbook(
     'replace' overwrites; 'error' raises if the file exists.
     """
     out = Path(output_path)
-    if not _is_excel_path(out):
-        raise ValueError("output_path must end with .xlsx or .xlsm")
+    if not _is_openpyxl_workbook(out):
+        raise ValueError(
+            f"output_path must end with .xlsx or .xlsm.{_legacy_xls_hint(out)}"
+        )
     if out.exists() and if_file_exists == "error":
         raise FileExistsError(output_path)
     if not sheets:
@@ -987,6 +1224,24 @@ def write_multisheet_workbook(
 
 @mcp.tool()
 @safe_run
+def write_csv(
+    file_path: str,
+    data: list[dict[str, Any]],
+    sep: str = ",",
+    encoding: str = "utf-8",
+    index: bool = False,
+) -> str:
+    """Write row dicts to a CSV file (overwrites)."""
+    path = Path(file_path)
+    if path.suffix.lower() != ".csv":
+        raise ValueError("file_path must end with .csv")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(data).to_csv(file_path, sep=sep, encoding=encoding, index=index)
+    return f"Wrote {len(data)} row(s) to {file_path!r}."
+
+
+@mcp.tool()
+@safe_run
 def write_range_matrix(
     file_path: str,
     sheet_name: str,
@@ -999,8 +1254,10 @@ def write_range_matrix(
     Creates the file or sheet if needed.
     """
     path = Path(file_path)
-    if not _is_excel_path(path):
-        raise ValueError("write_range_matrix requires .xlsx or .xlsm")
+    if not _is_openpyxl_workbook(path):
+        raise ValueError(
+            f"write_range_matrix requires .xlsx or .xlsm.{_legacy_xls_hint(path)}"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     st = _truncate_sheet_title(sheet_name)
     start_row, start_col = _a1_to_row_col(start_cell)
@@ -1036,8 +1293,10 @@ def add_workbook_sheet(file_path: str, sheet_name: str) -> str:
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(file_path)
-    if not _is_excel_path(path):
-        raise ValueError("add_workbook_sheet requires .xlsx or .xlsm")
+    if not _is_openpyxl_workbook(path):
+        raise ValueError(
+            f"add_workbook_sheet requires .xlsx or .xlsm.{_legacy_xls_hint(path)}"
+        )
     st = _truncate_sheet_title(sheet_name)
     wb = load_workbook(path, keep_vba=_keep_vba(path))
     try:
@@ -1060,8 +1319,10 @@ def delete_sheet(file_path: str, sheet_name: str) -> str:
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(file_path)
-    if not _is_excel_path(path):
-        raise ValueError("delete_sheet requires .xlsx or .xlsm")
+    if not _is_openpyxl_workbook(path):
+        raise ValueError(
+            f"delete_sheet requires .xlsx or .xlsm.{_legacy_xls_hint(path)}"
+        )
     wb = load_workbook(path, keep_vba=_keep_vba(path))
     try:
         if sheet_name not in wb.sheetnames:
@@ -1087,8 +1348,10 @@ def rename_sheet(file_path: str, old_name: str, new_name: str) -> str:
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(file_path)
-    if not _is_excel_path(path):
-        raise ValueError("rename_sheet requires .xlsx or .xlsm")
+    if not _is_openpyxl_workbook(path):
+        raise ValueError(
+            f"rename_sheet requires .xlsx or .xlsm.{_legacy_xls_hint(path)}"
+        )
     st_new = _truncate_sheet_title(new_name)
     wb = load_workbook(path, keep_vba=_keep_vba(path))
     try:
@@ -1112,9 +1375,18 @@ def create_summary_sheet(
     output_file: str,
     group_by_column: str | None = None,
     sheet_name: str | int | None = None,
+    csv_sep: str | None = None,
+    csv_encoding: str | None = None,
+    csv_decimal: str | None = None,
 ) -> str:
     """Create a workbook with raw data and a numeric sum grouped by one column."""
-    df = load_data(file_path, sheet_name)
+    df = load_data(
+        file_path,
+        sheet_name,
+        csv_sep=csv_sep,
+        csv_encoding=csv_encoding,
+        csv_decimal=csv_decimal,
+    )
 
     if df.shape[1] == 0:
         raise ValueError("Dataset has no columns to group by")
