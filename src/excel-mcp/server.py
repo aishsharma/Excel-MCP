@@ -382,19 +382,22 @@ def list_datasets(folder_path: str) -> list[str]:
 @mcp.tool()
 @safe_run
 def inspect_excel(file_path: str) -> dict[str, Any]:
-    """Return sheet names, columns, types, and preview rows."""
+    """Return sheet names, columns, types, and preview rows (.xlsx / .xlsm / .xls)."""
     path = Path(file_path)
-    if not _is_openpyxl_workbook(path):
+    if not (
+        _is_openpyxl_workbook(path) or _is_legacy_excel_path(path)
+    ):
         raise ValueError(
-            f"inspect_excel only supports .xlsx and .xlsm workbooks.{_legacy_xls_hint(path)}"
+            "inspect_excel supports .xlsx, .xlsm, and .xls workbooks."
         )
 
-    with pd.ExcelFile(file_path, engine="openpyxl") as xls:
+    engine = _excel_read_engine(path)
+    with pd.ExcelFile(file_path, engine=engine) as xls:
         info: dict[str, Any] = {}
 
         for sheet in xls.sheet_names:
             df = pd.read_excel(
-                file_path, sheet_name=sheet, nrows=20, engine="openpyxl"
+                file_path, sheet_name=sheet, nrows=20, engine=engine
             )
 
             info[str(sheet)] = {
